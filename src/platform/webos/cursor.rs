@@ -78,11 +78,29 @@ impl Cursor {
     /// Uncaptured is the menu/desktop state: visible, absolute. Desktop streams still grab the
     /// HID mouse (so Quick Control never sees a double right-click) and warp this pointer to
     /// follow; [`super::evmouse::HidMouse::take_warp`] drives that.
-    pub fn warp_abs(&self, window: &sdl2::video::Window, x: i32, y: i32) {
+    ///
+    /// Grab starves the compositor of HID reports, so after the Magic Remote has been used the
+    /// TV arrow can stay retracted until something asks it back — warp plus a visibility poke.
+    pub fn warp_abs(&mut self, window: &sdl2::video::Window, x: i32, y: i32) {
         if self.captured {
             return;
         }
         self.mouse.warp_mouse_in_window(window, x, y);
+        self.reassert_shown();
+    }
+
+    /// Keep the TV pointer painted in desktop/absolute. Debounced: Wayland requests are not
+    /// free, and HID motion already arrives faster than the eye.
+    pub fn reassert_shown(&mut self) {
+        if self.captured {
+            return;
+        }
+        self.mouse.show_cursor(true);
+        if self.last_assert.elapsed() < REASSERT_INTERVAL {
+            return;
+        }
+        set_compositor_visible(true);
+        self.last_assert = Instant::now();
     }
 
     fn apply(&mut self) {

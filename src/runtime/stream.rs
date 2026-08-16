@@ -597,6 +597,19 @@ pub(super) fn run_inner() -> Result<()> {
             }
             if let Some(hid) = &hid_mouse {
                 hid.set_active(!disconnect.is_open());
+                if !settings.cursor_capture {
+                    // Remote (and warp echoes) update SDL's pointer while HID is idle. Seed the
+                    // integrator from that so switching back to the Bluetooth mouse continues from
+                    // where the remote left the arrow, instead of warping to a stale HID origin
+                    // (which also leaves the compositor arrow retracted).
+                    if !hid.owns_sdl_motion() {
+                        let ms = events.mouse_state();
+                        hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
+                    }
+                    if hid.owns_sdl_motion() || hid.owns_sdl_clicks() {
+                        cursor.reassert_shown();
+                    }
+                }
                 if let Some((x, y)) = hid.take_warp() {
                     cursor.warp_abs(canvas.window(), x, y);
                 }

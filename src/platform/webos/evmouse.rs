@@ -5,8 +5,9 @@
 //! client does with them. evdev is the same bypass aurora-tv ships as "Use Hardware Mouse".
 //! Keyboards need the same exclusive grab in **both** cursor modes: an ungrabbled USB/Bluetooth
 //! keyboard still reaches surface-manager, which then treats modifier+click as a system gesture
-//! and warps its pointer to screen centre on the first typed character. The Magic Remote is an
-//! absolute-pointer node and is never opened here.
+//! and warps its pointer to screen centre on the first typed character. Grab also starves SDL of
+//! hold-to-repeat, so kernel `EV_KEY` value 2 is forwarded as extra `KeyDown`s (Backspace, arrows,
+//! letters). The Magic Remote is an absolute-pointer node and is never opened here.
 //!
 //! **Two cursor modes.** Capture on (games): mouse grabbed, SDL relative off, compositor
 //! pointer hidden, host draws the cursor. Capture off (desktop/absolute): mouse is still
@@ -66,6 +67,16 @@ const BTN_EXTRA: u16 = 0x114;
 
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_A: u16 = 30;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_LEFTALT: u16 = 56;
+const KEY_CAPSLOCK: u16 = 58;
+const KEY_NUMLOCK: u16 = 69;
+const KEY_SCROLLLOCK: u16 = 70;
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_RIGHTALT: u16 = 100;
+const KEY_LEFTMETA: u16 = 125;
+const KEY_RIGHTMETA: u16 = 126;
 
 /// `poll` revents bits that mean the node is gone, not readable.
 const DEAD: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
@@ -614,21 +625,34 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) {
                     }
                     _ => {}
                 },
-                // `value == 2` is autorepeat, keyboard-only; matching 0/1 explicitly to be safe.
-                EV_KEY if ev.value == 0 || ev.value == 1 => {
+                EV_KEY => {
                     if dev.mouse {
                         if let Some(button) = button_code(ev.code) {
-                            shared.activity.touch(&shared.activity.discrete_ms);
-                            // Motion first: the click must land where the pointer already is.
-                            flush_motion(dev, sink, shared);
-                            sink(&mouse::raw_button_event(button, ev.value == 1));
+                            // Mouse-button autorepeat (value 2) is not a click.
+                            if ev.value == 0 || ev.value == 1 {
+                                shared.activity.touch(&shared.activity.discrete_ms);
+                                // Motion first: the click must land where the pointer already is.
+                                flush_motion(dev, sink, shared);
+                                sink(&mouse::raw_button_event(button, ev.value == 1));
+                            }
                             continue;
                         }
                     }
                     if dev.keyboard {
+                        // 0 = release, 1 = press, 2 = kernel autorepeat. Grab starves SDL of
+                        // the hold-to-repeat KeyDowns it used to synthesize, so Backspace /
+                        // arrows / letters would fire once per tap unless 2 is forwarded as
+                        // another KeyDown. Modifiers must not repeat — Windows treats extra
+                        // Ctrl/Alt/Shift downs as stuck keys.
+                        let pressed = match ev.value {
+                            0 => false,
+                            1 => true,
+                            2 if !is_modifier_key(ev.code) => true,
+                            _ => continue,
+                        };
                         if let Some(vk) = keyboard::vk_from_evdev(ev.code) {
                             shared.activity.touch(&shared.activity.key_ms);
-                            sink(&keyboard::raw_key_event(vk, ev.value == 1));
+                            sink(&keyboard::raw_key_event(vk, pressed));
                         }
                     }
                 }
@@ -663,6 +687,24 @@ fn flush_motion(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) 
     }
     dev.dx = 0;
     dev.dy = 0;
+}
+
+/// Ctrl/Alt/Shift/Meta/locks — kernel autorepeat for these must not become extra KeyDowns.
+fn is_modifier_key(code: u16) -> bool {
+    matches!(
+        code,
+        KEY_LEFTCTRL
+            | KEY_RIGHTCTRL
+            | KEY_LEFTSHIFT
+            | KEY_RIGHTSHIFT
+            | KEY_LEFTALT
+            | KEY_RIGHTALT
+            | KEY_LEFTMETA
+            | KEY_RIGHTMETA
+            | KEY_CAPSLOCK
+            | KEY_NUMLOCK
+            | KEY_SCROLLLOCK
+    )
 }
 
 /// evdev button → wire numbering (orderings differ: evdev has RIGHT before MIDDLE, wire has
@@ -714,7 +756,9 @@ fn hex_word(s: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_tv_builtin, proc_has_hid_mouse};
+    use super::{
+        is_modifier_key, is_tv_builtin, proc_has_hid_mouse, KEY_A, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTSHIFT,
+    };
 
     const DEVICES: &str = r#"
 I: Bus=0003 Vendor=0000 Product=0000 Version=0004
@@ -750,5 +794,15 @@ B: REL=1943
         assert!(is_tv_builtin("CHECK INPUT"));
         assert!(!is_tv_builtin("M720 Triathlon Mouse"));
         assert!(!is_tv_builtin("MX MCHNCL M Keyboard"));
+    }
+
+    #[test]
+    fn modifiers_are_not_repeatable_keys() {
+        assert!(is_modifier_key(KEY_LEFTCTRL));
+        assert!(is_modifier_key(KEY_LEFTSHIFT));
+        assert!(is_modifier_key(KEY_LEFTALT));
+        assert!(!is_modifier_key(14)); // KEY_BACKSPACE
+        assert!(!is_modifier_key(105)); // KEY_LEFT
+        assert!(!is_modifier_key(KEY_A));
     }
 }

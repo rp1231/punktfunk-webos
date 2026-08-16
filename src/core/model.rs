@@ -218,8 +218,10 @@ pub struct Settings {
     /// hidden, relative `MouseMove` deltas sent (absolute coords stop at the panel edge), host
     /// draws the only cursor. Off: absolute `MouseMoveAbs`, and `CLIENT_CAP_CURSOR` tells a
     /// capable host to stop compositing its own so the local pointer stays visible — otherwise
-    /// two cursors or none. USB/Bluetooth keyboards are grabbed in both modes so the compositor
-    /// never sees modifiers or typing; mice follow this flag. Takes effect next stream;
+    /// two cursors or none. USB/Bluetooth keyboards **and mice** are grabbed in both modes so
+    /// the compositor never sees modifiers, typing, or a double right-click (Quick Control).
+    /// Capture off still aims with the TV pointer: HID motion is absolute and the compositor
+    /// cursor is warped to follow. Takes effect next stream;
     /// `serde(default)` keeps old settings.json loading as `true`.
     #[serde(default = "default_cursor_capture")]
     pub cursor_capture: bool,

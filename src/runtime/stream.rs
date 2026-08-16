@@ -231,13 +231,17 @@ pub(super) fn run_inner() -> Result<()> {
         // its Red key — see `RemoteButtons`. Fed only the remote's own input; a real HID mouse's
         // clicks never reach it.
         let mut buttons = mouse::RemoteButtons::default();
-        // Raw evdev HID. Keyboard nodes are always grabbed so the compositor doesn't see
-        // Ctrl/Alt/Shift or typing (that's what made the TV pointer fight the host). Mouse
-        // nodes follow Capture: on = exclusive relative grab; off = compositor keeps the
-        // pointer for desktop/absolute aiming.
+        // Raw evdev HID. Keyboard and mouse nodes are grabbed in both cursor modes so the
+        // compositor doesn't see Ctrl/Alt/Shift, typing, or a double right-click (Quick Control).
+        // Capture on: relative deltas, TV pointer hidden. Capture off: absolute + warp so CAD
+        // still aims with the TV cursor.
         let input = connected.input();
         let hid_mouse =
             crate::platform::webos::evmouse::HidMouse::start(true, settings.cursor_capture, move |ev| input.send(ev));
+        if let Some(hid) = hid_mouse.as_ref() {
+            let ms = events.mouse_state();
+            hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
+        }
         // Flips once a HID mouse is found — `HidMouse::start` no longer scans before returning
         // (that blocked every stream connect on the node-open cost), so presence is only known
         // once the reader thread's own scan catches up; checked each tick below.
@@ -319,16 +323,16 @@ pub(super) fn run_inner() -> Result<()> {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
-                // Capture on + HID mouse: drop every SDL pointer event. Capture off: compositor
-                // owns the mouse; drop pointer events only while a HID keyboard is busy so a
-                // keypress can't warp the host cursor to centre. Keyboard echoes use recency
-                // so Magic Remote keys still pass.
+                // Capture on + HID mouse: drop every SDL pointer event. Capture off: mouse is
+                // still grabbed (Quick Control); drop SDL pointer only while HID motion/clicks
+                // or keys are busy so Magic Remote and warp-echoes don't double-send.
                 let (hid_motion, hid_clicks, hid_keys) = match hid_mouse.as_ref() {
                     Some(hid) if settings.cursor_capture && hid.has_device() => (true, true, hid.owns_sdl_keys()),
-                    // Desktop/absolute: compositor owns the mouse. Drop pointer events only
-                    // while a HID keyboard is busy, so a keypress can't warp the host cursor
-                    // to centre via an SDL echo.
-                    Some(hid) => (hid.owns_sdl_keys(), hid.owns_sdl_keys(), hid.owns_sdl_keys()),
+                    Some(hid) => (
+                        hid.owns_sdl_motion() || hid.owns_sdl_keys(),
+                        hid.owns_sdl_clicks() || hid.owns_sdl_keys(),
+                        hid.owns_sdl_keys(),
+                    ),
                     None => (false, false, false),
                 };
                 match event {
@@ -593,6 +597,9 @@ pub(super) fn run_inner() -> Result<()> {
             }
             if let Some(hid) = &hid_mouse {
                 hid.set_active(!disconnect.is_open());
+                if let Some((x, y)) = hid.take_warp() {
+                    cursor.warp_abs(canvas.window(), x, y);
+                }
             }
             // Wider than `is_open()`: a dismissed dialog still draws (fading out) a few more
             // ticks, used below to skip the stats overlay for exactly those ticks.

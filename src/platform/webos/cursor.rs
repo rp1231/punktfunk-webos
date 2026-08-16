@@ -71,8 +71,14 @@ impl Cursor {
         self.apply();
     }
 
-    pub fn is_captured(&self) -> bool {
-        self.captured
+    /// Uncaptured is the menu/desktop state: visible, absolute. Desktop streams still grab the
+    /// HID mouse (so Quick Control never sees a double right-click) and warp this pointer to
+    /// follow; [`super::evmouse::HidMouse::take_warp`] drives that.
+    pub fn warp_abs(&self, window: &sdl2::video::Window, x: i32, y: i32) {
+        if self.captured {
+            return;
+        }
+        self.mouse.warp_mouse_in_window(window, x, y);
     }
 
     fn apply(&mut self) {

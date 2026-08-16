@@ -65,15 +65,12 @@ fn make_lsm_cursor(hotspot: i32) -> Option<NonNull<sdl2::sys::SDL_Cursor>> {
     // SAFETY: `surface.raw()` is a live `SDL_Surface` for this call; SDL copies the pixels
     // into the Wayland cursor. The surface may drop afterwards. The `SDL_Cursor` is leaked
     // on purpose — freeing it would `SDL_SetCursor(def)` and undo hotspot 255 on stream exit.
-    let raw = match NonNull::new(unsafe { sdl2::sys::SDL_CreateColorCursor(surface.raw(), hotspot, hotspot) }) {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                "SDL_CreateColorCursor hotspot {hotspot} failed: {}",
-                sdl2::get_error()
-            );
-            return None;
-        }
+    let Some(raw) = NonNull::new(unsafe { sdl2::sys::SDL_CreateColorCursor(surface.raw(), hotspot, hotspot) }) else {
+        tracing::warn!(
+            "SDL_CreateColorCursor hotspot {hotspot} failed: {}",
+            sdl2::get_error()
+        );
+        return None;
     };
     Some(raw)
 }

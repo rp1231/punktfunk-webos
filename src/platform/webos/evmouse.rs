@@ -10,12 +10,13 @@
 //! letters). The Magic Remote is an absolute-pointer node and is never opened here.
 //!
 //! **Two cursor modes.** Capture on (games): mouse grabbed, SDL relative off, compositor
-//! pointer hidden, host draws the cursor. Capture off (desktop/absolute): **keyboard still
-//! grabbed**, mouse is only read — grabbing it freezes the TV pointer (`EVIOCGRAB` starves
-//! surface-manager, and neither warp nor `SDL_webOSCursorVisibility` can paint an arrow the
-//! compositor has no device for). Motion is integrated to absolute coords so CAD aims with
-//! the TV cursor. Double-right-click may still launch Quick Control; that is the trade for a
-//! visible pointer. The Magic Remote is an absolute-pointer node and is never opened here.
+//! pointer hidden, host draws the cursor from raw evdev deltas. Capture off (desktop/absolute):
+//! **keyboard still grabbed**, mouse left entirely to the compositor — the TV pointer is what
+//! CAD aims with, and SDL absolute events (the same pointer) go to the host. Forwarding raw
+//! evdev motion in parallel applied a different acceleration curve, so the host cursor only
+//! agreed at the last hover and the gap grew with distance. Double-right-click may still
+//! launch Quick Control; that is the trade for a visible pointer. The Magic Remote is an
+//! absolute-pointer node and is never opened here.
 //!
 //! **Access.** Unlike `/dev/hidraw*` (jail-blocked, see `dualsense.rs`), evdev nodes are
 //! reachable: `root:compositor 0660`, and the app's uid carries gid 505 in its supplementary
@@ -39,7 +40,7 @@
 
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -141,13 +142,9 @@ struct Shared {
     /// drive `EVIOCGRAB`) and by the reader thread's gated `sink` wrapper; the per-device
     /// *applied* grab state lives on [`Device`], not here.
     grab: AtomicBool,
-    /// Capture on: relative `MouseMove` deltas AND mouse `EVIOCGRAB`. Capture off: integrate
-    /// to absolute and leave the mouse ungrabbed so the compositor can still draw its arrow.
+    /// Capture on: relative `MouseMove` deltas AND mouse `EVIOCGRAB`. Capture off: mouse
+    /// nodes are not opened; the compositor pointer + SDL absolute events are the host path.
     relative: AtomicBool,
-    abs_x: AtomicI32,
-    abs_y: AtomicI32,
-    abs_w: AtomicU32,
-    abs_h: AtomicU32,
     activity: Activity,
 }
 
@@ -197,18 +194,14 @@ impl HidMouse {
     ///
     /// `active` is the initial [`set_active`](Self::set_active) state — passed here instead of
     /// left to a follow-up call so a caller that always wants "started active" can't forget it.
-    /// `relative` is Capture: false integrates motion to absolute (desktop/absolute) and does
-    /// not grab mouse nodes (the TV pointer has to keep receiving reports).
+    /// `relative` is Capture: false leaves mouse nodes to the compositor (desktop/absolute)
+    /// so the TV pointer and the host share one acceleration curve.
     pub fn start(active: bool, relative: bool, sink: impl Fn(&InputEvent) + Send + 'static) -> Option<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             has_device: AtomicBool::new(false),
             grab: AtomicBool::new(active),
             relative: AtomicBool::new(relative),
-            abs_x: AtomicI32::new(0),
-            abs_y: AtomicI32::new(0),
-            abs_w: AtomicU32::new(0),
-            abs_h: AtomicU32::new(0),
             activity: Activity::new(),
         });
         let thread_shared = Arc::clone(&shared);
@@ -250,26 +243,6 @@ impl HidMouse {
     /// SDL's echo of that keyboard without dropping the Magic Remote.
     pub fn owns_sdl_keys(&self) -> bool {
         self.shared.activity.recent(&self.shared.activity.key_ms)
-    }
-
-    /// True while the mouse moved within [`IN_USE_WINDOW`] — caller should drop SDL's echo of it.
-    pub fn owns_sdl_motion(&self) -> bool {
-        self.shared.activity.recent(&self.shared.activity.motion_ms)
-    }
-
-    /// Same question for SDL's buttons/wheel; also true during motion, so a click mid-drag is
-    /// covered even if its echo arrives before this reader's own read of it.
-    pub fn owns_sdl_clicks(&self) -> bool {
-        self.shared.activity.recent(&self.shared.activity.discrete_ms) || self.owns_sdl_motion()
-    }
-
-    /// Desktop/absolute origin: current SDL pointer and the panel size `move_event` stamps.
-    /// Call before the reader thread's first flush; later motion integrates from here.
-    pub fn set_abs_origin(&self, x: i32, y: i32, width: u32, height: u32) {
-        self.shared.abs_x.store(x, Ordering::Relaxed);
-        self.shared.abs_y.store(y, Ordering::Relaxed);
-        self.shared.abs_w.store(width, Ordering::Relaxed);
-        self.shared.abs_h.store(height, Ordering::Relaxed);
     }
 }
 
@@ -323,7 +296,7 @@ enum Probe {
 }
 
 /// Opens every mouse- or keyboard-shaped node not already in `seen`, appending the paths it takes.
-fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
+fn scan(seen: &mut Vec<PathBuf>, want_mouse: bool) -> Vec<Device> {
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         tracing::warn!("/dev/input unreadable — no HID mouse support");
         return Vec::new();
@@ -342,7 +315,7 @@ fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
     paths.sort();
     let mut devices = Vec::new();
     for path in paths {
-        match open_hid(&path) {
+        match open_hid(&path, want_mouse) {
             Probe::Hid(dev) => {
                 seen.push(path);
                 devices.push(dev);
@@ -361,7 +334,7 @@ fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
 /// absolute pointer, which is what separates a desk mouse from the Magic Remote. A HID
 /// keyboard is a node with `KEY_A`/`KEY_LEFTCTRL` that isn't a TV-builtin remote — those
 /// advertise every key bit, so the name denylist is load-bearing.
-fn open_hid(path: &Path) -> Probe {
+fn open_hid(path: &Path, want_mouse: bool) -> Probe {
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return Probe::Skip;
     };
@@ -402,6 +375,12 @@ fn open_hid(path: &Path) -> Probe {
     // without being a keyboard. Absolute-pointer remotes are already excluded above.
     dev.keyboard = !absolute_pointer && (bit(&key, KEY_A) || bit(&key, KEY_LEFTCTRL));
     if !dev.mouse && !dev.keyboard {
+        return Probe::Skip;
+    }
+    // Desktop/absolute: leave mouse-only nodes to the compositor so CAD aims with the TV
+    // pointer. Combo keyboard+mouse nodes stay open for the keys; mouse reports on those
+    // are ignored in `read_device` when Capture is off.
+    if dev.mouse && !dev.keyboard && !want_mouse {
         return Probe::Skip;
     }
     tracing::info!(
@@ -485,7 +464,7 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
     // delay, so boosting priority wouldn't speed it up — it would just pull CPU from the video
     // pump during exactly the busiest window (stream connect) for no benefit.
     let mut seen: Vec<PathBuf> = Vec::new();
-    let mut devices = scan(&mut seen);
+    let mut devices = scan(&mut seen, shared.relative.load(Ordering::Relaxed));
     if devices.is_empty() {
         tracing::info!("no HID mouse/keyboard on /dev/input yet — using SDL pointer until one appears");
     } else {
@@ -547,7 +526,7 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
             let mtime = std::fs::metadata("/dev/input").and_then(|m| m.modified()).ok();
             if mtime != dir_mtime {
                 dir_mtime = mtime;
-                let found = scan(&mut seen);
+                let found = scan(&mut seen, shared.relative.load(Ordering::Relaxed));
                 if !found.is_empty() {
                     devices.extend(found);
                     fds = pollfds(&devices);
@@ -594,7 +573,7 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) {
             // buffer offset carries no alignment guarantee.
             let ev = unsafe { chunk.as_ptr().cast::<InputEventRaw>().read_unaligned() };
             match ev.kind {
-                EV_REL if dev.mouse => match ev.code {
+                EV_REL if dev.mouse && shared.relative.load(Ordering::Relaxed) => match ev.code {
                     REL_X | REL_Y => {
                         shared.activity.touch(&shared.activity.motion_ms);
                         if ev.code == REL_X {
@@ -617,8 +596,9 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) {
                 EV_KEY => {
                     if dev.mouse {
                         if let Some(button) = button_code(ev.code) {
-                            // Mouse-button autorepeat (value 2) is not a click.
-                            if ev.value == 0 || ev.value == 1 {
+                            if shared.relative.load(Ordering::Relaxed)
+                                && (ev.value == 0 || ev.value == 1)
+                            {
                                 shared.activity.touch(&shared.activity.discrete_ms);
                                 // Motion first: the click must land where the pointer already is.
                                 flush_motion(dev, sink, shared);
@@ -655,23 +635,14 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) {
     flush_motion(dev, sink, shared);
 }
 
-/// Sends the accumulated deltas as one `MouseMove` (Capture) or integrates them into an
-/// absolute `MouseMoveAbs` (desktop) — undamped, because damping is for the remote's coarse
-/// deltas and would make a real mouse sluggish.
+/// Sends the accumulated deltas as one `MouseMove` — Capture only. Desktop leaves the
+/// pointer to the compositor; raw evdev REL has a different acceleration curve.
 fn flush_motion(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) {
     if dev.dx == 0 && dev.dy == 0 {
         return;
     }
     if shared.relative.load(Ordering::Relaxed) {
         sink(&mouse::move_relative_event(dev.dx, dev.dy));
-    } else {
-        let w = shared.abs_w.load(Ordering::Relaxed).max(1);
-        let h = shared.abs_h.load(Ordering::Relaxed).max(1);
-        let x = (shared.abs_x.load(Ordering::Relaxed) + dev.dx).clamp(0, w as i32 - 1);
-        let y = (shared.abs_y.load(Ordering::Relaxed) + dev.dy).clamp(0, h as i32 - 1);
-        shared.abs_x.store(x, Ordering::Relaxed);
-        shared.abs_y.store(y, Ordering::Relaxed);
-        sink(&mouse::move_event(x, y, w, h));
     }
     dev.dx = 0;
     dev.dy = 0;

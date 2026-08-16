@@ -236,19 +236,15 @@ pub(super) fn run_inner() -> Result<()> {
         let mut buttons = mouse::RemoteButtons::default();
         // Raw evdev HID. Keyboards are grabbed in both cursor modes so the compositor never
         // sees Ctrl/Alt/Shift or typing. Capture on: also grab the mouse, hide the TV pointer,
-        // relative deltas. Capture off: leave the mouse ungrabbed so the compositor keeps
-        // drawing the TV cursor CAD aims with.
+        // relative deltas. Capture off: mouse stays with the compositor; SDL absolute events
+        // (that same pointer) go to the host so CAD's arrow and clicks share one curve.
         let input = connected.input();
         let hid_mouse =
             crate::platform::webos::evmouse::HidMouse::start(true, settings.cursor_capture, move |ev| input.send(ev));
-        if let Some(hid) = hid_mouse.as_ref() {
+        if !settings.cursor_capture {
             let ms = events.mouse_state();
-            hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
-            if !settings.cursor_capture {
-                // Snap compositor to SDL so a previous Capture-on session's centre-warp /
-                // grab-freeze cannot leave the TV arrow a constant delta from the mouse.
-                cursor.warp_abs(canvas.window(), ms.x(), ms.y());
-            }
+            // Snap compositor to SDL after a previous Capture-on session.
+            cursor.warp_abs(canvas.window(), ms.x(), ms.y());
         }
         // Flips once a HID mouse is found — `HidMouse::start` no longer scans before returning
         // (that blocked every stream connect on the node-open cost), so presence is only known
@@ -339,16 +335,12 @@ pub(super) fn run_inner() -> Result<()> {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
-                // Capture on + HID mouse: drop every SDL pointer event. Capture off: mouse is
-                // not grabbed (TV pointer has to keep drawing); drop SDL pointer only while HID
-                // motion/clicks or keys are busy so Magic Remote events don't double-send.
+                // Capture on + HID mouse: drop every SDL pointer event. Capture off: the TV
+                // pointer is the host pointer — forward SDL (compositor) motion, and only drop
+                // SDL keys while the HID keyboard is busy so the Magic Remote still types.
                 let (hid_motion, hid_clicks, hid_keys) = match hid_mouse.as_ref() {
                     Some(hid) if settings.cursor_capture && hid.has_device() => (true, true, hid.owns_sdl_keys()),
-                    Some(hid) => (
-                        hid.owns_sdl_motion() || hid.owns_sdl_keys(),
-                        hid.owns_sdl_clicks() || hid.owns_sdl_keys(),
-                        hid.owns_sdl_keys(),
-                    ),
+                    Some(hid) => (false, false, hid.owns_sdl_keys()),
                     None => (false, false, false),
                 };
                 match event {
@@ -613,13 +605,6 @@ pub(super) fn run_inner() -> Result<()> {
             }
             if let Some(hid) = &hid_mouse {
                 hid.set_active(!disconnect.is_open());
-                // Remote updates SDL's pointer while HID is idle. Seed the integrator from that
-                // so switching back to the Bluetooth mouse continues from where the remote left
-                // the arrow.
-                if !settings.cursor_capture && !hid.owns_sdl_motion() {
-                    let ms = events.mouse_state();
-                    hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
-                }
             }
             // Wider than `is_open()`: a dismissed dialog still draws (fading out) a few more
             // ticks, used below to skip the stats overlay for exactly those ticks.

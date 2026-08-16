@@ -146,6 +146,9 @@ pub(super) fn run_inner() -> Result<()> {
         // Local pointer hidden unless "Cursor capture" is off — otherwise it and the host's own
         // forwarded-position cursor read as "the pointer doesn't match the mouse".
         let mut cursor = cursor::Cursor::new(sdl.mouse());
+        // HID is always started below. Relative mode on this fork warps to screen centre;
+        // leave it off until we know there is no HID mouse, or Capture-off inherits an offset.
+        cursor.disable_sdl_relative();
         cursor.set_captured(settings.cursor_capture);
 
         // `None` when the session decodes audio somewhere other than here (punktfunk's NDL Opus
@@ -241,11 +244,18 @@ pub(super) fn run_inner() -> Result<()> {
         if let Some(hid) = hid_mouse.as_ref() {
             let ms = events.mouse_state();
             hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
+            if !settings.cursor_capture {
+                // Snap compositor to SDL so a previous Capture-on session's centre-warp /
+                // grab-freeze cannot leave the TV arrow a constant delta from the mouse.
+                cursor.warp_abs(canvas.window(), ms.x(), ms.y());
+            }
         }
         // Flips once a HID mouse is found — `HidMouse::start` no longer scans before returning
         // (that blocked every stream connect on the node-open cost), so presence is only known
         // once the reader thread's own scan catches up; checked each tick below.
         let mut hid_device_seen = false;
+        let hid_probe_at = Instant::now();
+        let mut capture_relative_fallback = false;
         // Stats overlay: refreshed ~2Hz onto the transparent stream window, over the
         // punch-through video plane via per-pixel alpha — window is never shown/hidden (that
         // crashed an earlier attempt, see docs/NOTES.md). Green button flips it live, session-only.
@@ -308,18 +318,24 @@ pub(super) fn run_inner() -> Result<()> {
                 connected.disconnect_quit();
                 break 'running StreamOutcome::Quit;
             }
-            if settings.cursor_capture
-                && !hid_device_seen
-                && hid_mouse
-                    .as_ref()
-                    .is_some_and(crate::platform::webos::evmouse::HidMouse::has_device)
-            {
-                hid_device_seen = true;
-                cursor.disable_sdl_relative();
-                // Only now is the node grabbed, so only now can a compositor hide stick — the one
-                // at connect raced the reader thread's scan. Usually a no-op, since the call
-                // above re-issued it already; kept so the retract doesn't hinge on that.
-                cursor.reassert_hidden();
+            if settings.cursor_capture && !disconnect.is_open() {
+                if !hid_device_seen
+                    && hid_mouse
+                        .as_ref()
+                        .is_some_and(crate::platform::webos::evmouse::HidMouse::has_device)
+                {
+                    hid_device_seen = true;
+                    // Only now is the node grabbed, so only now can a compositor hide stick — the
+                    // one at connect raced the reader thread's scan.
+                    cursor.reassert_hidden();
+                } else if !hid_device_seen
+                    && !capture_relative_fallback
+                    && hid_probe_at.elapsed() >= Duration::from_secs(2)
+                {
+                    // No HID mouse — Magic Remote needs unbounded SDL deltas.
+                    capture_relative_fallback = true;
+                    cursor.enable_sdl_relative();
+                }
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
@@ -874,7 +890,14 @@ pub(super) fn run_inner() -> Result<()> {
         }
         // Put the TV's picture/sound modes back (no-op unless game mode switched them).
         crate::platform::webos::game_mode::restore(restore_tv_modes);
+        // Release the HID grab before showing the pointer again, then snap compositor to SDL
+        // so the menu (and the next Capture-off stream) does not inherit Capture-on's offset.
+        drop(hid_mouse);
         cursor.set_captured(false);
+        {
+            let ms = events.mouse_state();
+            cursor.warp_abs(canvas.window(), ms.x(), ms.y());
+        }
         match outcome {
             StreamOutcome::Quit => {
                 tracing::info!("punktfunk-webos exiting cleanly");

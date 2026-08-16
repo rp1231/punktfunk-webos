@@ -58,8 +58,18 @@ impl Cursor {
     /// Stop asking SDL for relative mode, for when motion is read via `super::evmouse` instead:
     /// the fork emulates relative mode with a screen-centre warp per motion event, which is
     /// pure waste for a source we don't read. aurora-tv does the same under `hardware_mouse`.
+    ///
+    /// Must run **before** [`Self::set_captured`]`(true)` when a HID mouse is expected: capture
+    /// otherwise enables relative mode for the HID scan window, parks SDL at screen centre,
+    /// and the next Capture-off stream shows the TV cursor at a constant offset.
     pub fn disable_sdl_relative(&mut self) {
         self.sdl_relative = false;
+        self.apply();
+    }
+
+    /// Capture-on fallback when no HID mouse shows up — Magic Remote needs unbounded deltas.
+    pub fn enable_sdl_relative(&mut self) {
+        self.sdl_relative = true;
         self.apply();
     }
 
@@ -73,6 +83,13 @@ impl Cursor {
 
     pub fn is_captured(&self) -> bool {
         self.captured
+    }
+
+    /// Put the compositor pointer on `(x, y)`. After Capture-on the two layers disagree
+    /// (SDL may be at the relative-mode centre, surface-manager at wherever grab froze it);
+    /// Capture-off has to snap them before HID relative motion is applied on top.
+    pub fn warp_abs(&self, window: &sdl2::video::Window, x: i32, y: i32) {
+        self.mouse.warp_mouse_in_window(window, x, y);
     }
 
     fn apply(&mut self) {

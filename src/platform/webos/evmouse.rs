@@ -689,7 +689,7 @@ fn flush_motion(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) 
     dev.dy = 0;
 }
 
-/// Ctrl/Alt/Shift/Meta/locks — kernel autorepeat for these must not become extra KeyDowns.
+/// Ctrl/Alt/Shift/Meta/locks — kernel autorepeat for these must not become extra key-downs.
 fn is_modifier_key(code: u16) -> bool {
     matches!(
         code,

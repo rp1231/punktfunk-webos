@@ -231,10 +231,10 @@ pub(super) fn run_inner() -> Result<()> {
         // its Red key — see `RemoteButtons`. Fed only the remote's own input; a real HID mouse's
         // clicks never reach it.
         let mut buttons = mouse::RemoteButtons::default();
-        // Raw evdev HID. Keyboard and mouse nodes are grabbed in both cursor modes so the
-        // compositor doesn't see Ctrl/Alt/Shift, typing, or a double right-click (Quick Control).
-        // Capture on: relative deltas, TV pointer hidden. Capture off: absolute + warp so CAD
-        // still aims with the TV cursor.
+        // Raw evdev HID. Keyboards are grabbed in both cursor modes so the compositor never
+        // sees Ctrl/Alt/Shift or typing. Capture on: also grab the mouse, hide the TV pointer,
+        // relative deltas. Capture off: leave the mouse ungrabbed so the compositor keeps
+        // drawing the TV cursor CAD aims with.
         let input = connected.input();
         let hid_mouse =
             crate::platform::webos::evmouse::HidMouse::start(true, settings.cursor_capture, move |ev| input.send(ev));
@@ -324,8 +324,8 @@ pub(super) fn run_inner() -> Result<()> {
             for event in events.poll_iter() {
                 use sdl2::event::Event;
                 // Capture on + HID mouse: drop every SDL pointer event. Capture off: mouse is
-                // still grabbed (Quick Control); drop SDL pointer only while HID motion/clicks
-                // or keys are busy so Magic Remote and warp-echoes don't double-send.
+                // not grabbed (TV pointer has to keep drawing); drop SDL pointer only while HID
+                // motion/clicks or keys are busy so Magic Remote events don't double-send.
                 let (hid_motion, hid_clicks, hid_keys) = match hid_mouse.as_ref() {
                     Some(hid) if settings.cursor_capture && hid.has_device() => (true, true, hid.owns_sdl_keys()),
                     Some(hid) => (
@@ -597,21 +597,12 @@ pub(super) fn run_inner() -> Result<()> {
             }
             if let Some(hid) = &hid_mouse {
                 hid.set_active(!disconnect.is_open());
-                if !settings.cursor_capture {
-                    // Remote (and warp echoes) update SDL's pointer while HID is idle. Seed the
-                    // integrator from that so switching back to the Bluetooth mouse continues from
-                    // where the remote left the arrow, instead of warping to a stale HID origin
-                    // (which also leaves the compositor arrow retracted).
-                    if !hid.owns_sdl_motion() {
-                        let ms = events.mouse_state();
-                        hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
-                    }
-                    if hid.owns_sdl_motion() || hid.owns_sdl_clicks() {
-                        cursor.reassert_shown();
-                    }
-                }
-                if let Some((x, y)) = hid.take_warp() {
-                    cursor.warp_abs(canvas.window(), x, y);
+                // Remote updates SDL's pointer while HID is idle. Seed the integrator from that
+                // so switching back to the Bluetooth mouse continues from where the remote left
+                // the arrow.
+                if !settings.cursor_capture && !hid.owns_sdl_motion() {
+                    let ms = events.mouse_state();
+                    hid.set_abs_origin(ms.x(), ms.y(), display_mode.w as u32, display_mode.h as u32);
                 }
             }
             // Wider than `is_open()`: a dismissed dialog still draws (fading out) a few more

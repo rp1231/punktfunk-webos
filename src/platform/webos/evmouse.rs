@@ -10,12 +10,12 @@
 //! letters). The Magic Remote is an absolute-pointer node and is never opened here.
 //!
 //! **Two cursor modes.** Capture on (games): mouse grabbed, SDL relative off, compositor
-//! pointer hidden, host draws the cursor. Capture off (desktop/absolute): mouse is still
-//! grabbed — otherwise a double right-click launches `com.webos.app.quickcontrol` and toasts
-//! "Quick Control cannot be run in this app" (`useAllMouseButtons` only stops the single-click
-//! Back/Home overlay). Motion is integrated to absolute coords and the compositor pointer is
-//! warped to follow, so CAD still aims with the TV cursor. The Magic Remote is an
-//! absolute-pointer node and is never opened here.
+//! pointer hidden, host draws the cursor. Capture off (desktop/absolute): **keyboard still
+//! grabbed**, mouse is only read — grabbing it freezes the TV pointer (`EVIOCGRAB` starves
+//! surface-manager, and neither warp nor `SDL_webOSCursorVisibility` can paint an arrow the
+//! compositor has no device for). Motion is integrated to absolute coords so CAD aims with
+//! the TV cursor. Double-right-click may still launch Quick Control; that is the trade for a
+//! visible pointer. The Magic Remote is an absolute-pointer node and is never opened here.
 //!
 //! **Access.** Unlike `/dev/hidraw*` (jail-blocked, see `dualsense.rs`), evdev nodes are
 //! reachable: `root:compositor 0660`, and the app's uid carries gid 505 in its supplementary
@@ -141,14 +141,13 @@ struct Shared {
     /// drive `EVIOCGRAB`) and by the reader thread's gated `sink` wrapper; the per-device
     /// *applied* grab state lives on [`Device`], not here.
     grab: AtomicBool,
-    /// Capture on: relative `MouseMove` deltas. Capture off: integrate to absolute and warp
-    /// the compositor pointer. Mouse nodes are grabbed in both modes.
+    /// Capture on: relative `MouseMove` deltas AND mouse `EVIOCGRAB`. Capture off: integrate
+    /// to absolute and leave the mouse ungrabbed so the compositor can still draw its arrow.
     relative: AtomicBool,
     abs_x: AtomicI32,
     abs_y: AtomicI32,
     abs_w: AtomicU32,
     abs_h: AtomicU32,
-    abs_dirty: AtomicBool,
     activity: Activity,
 }
 
@@ -198,7 +197,8 @@ impl HidMouse {
     ///
     /// `active` is the initial [`set_active`](Self::set_active) state — passed here instead of
     /// left to a follow-up call so a caller that always wants "started active" can't forget it.
-    /// `relative` is Capture: false integrates motion to absolute (desktop/absolute).
+    /// `relative` is Capture: false integrates motion to absolute (desktop/absolute) and does
+    /// not grab mouse nodes (the TV pointer has to keep receiving reports).
     pub fn start(active: bool, relative: bool, sink: impl Fn(&InputEvent) + Send + 'static) -> Option<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
@@ -209,7 +209,6 @@ impl HidMouse {
             abs_y: AtomicI32::new(0),
             abs_w: AtomicU32::new(0),
             abs_h: AtomicU32::new(0),
-            abs_dirty: AtomicBool::new(false),
             activity: Activity::new(),
         });
         let thread_shared = Arc::clone(&shared);
@@ -253,8 +252,7 @@ impl HidMouse {
         self.shared.activity.recent(&self.shared.activity.key_ms)
     }
 
-    /// True while the mouse moved within [`IN_USE_WINDOW`] — caller should drop SDL's echo of it
-    /// (including warps that keep the TV pointer on the HID position).
+    /// True while the mouse moved within [`IN_USE_WINDOW`] — caller should drop SDL's echo of it.
     pub fn owns_sdl_motion(&self) -> bool {
         self.shared.activity.recent(&self.shared.activity.motion_ms)
     }
@@ -272,21 +270,6 @@ impl HidMouse {
         self.shared.abs_y.store(y, Ordering::Relaxed);
         self.shared.abs_w.store(width, Ordering::Relaxed);
         self.shared.abs_h.store(height, Ordering::Relaxed);
-    }
-
-    /// Consumes a pending compositor warp for desktop/absolute. `None` if the pointer hasn't
-    /// moved since the last take, or while Capture is sending relative deltas instead.
-    pub fn take_warp(&self) -> Option<(i32, i32)> {
-        if self.shared.relative.load(Ordering::Relaxed) {
-            return None;
-        }
-        if !self.shared.abs_dirty.swap(false, Ordering::Relaxed) {
-            return None;
-        }
-        Some((
-            self.shared.abs_x.load(Ordering::Relaxed),
-            self.shared.abs_y.load(Ordering::Relaxed),
-        ))
     }
 }
 
@@ -459,9 +442,11 @@ fn bit(bits: &[u8; 128], code: u16) -> bool {
 
 /// Applies `want` to every device whose `grabbed` disagrees — same idempotent check as
 /// `commons-evmouse`'s `evmouse_set_grab`, so a steady state costs no ioctls at all.
-fn apply_grab(devices: &mut [Device], grab: bool) {
+/// Mouse nodes are grabbed only in Capture (`grab_mouse`); desktop leaves them to the
+/// compositor so the TV pointer keeps drawing.
+fn apply_grab(devices: &mut [Device], grab: bool, grab_mouse: bool) {
     for dev in devices {
-        let want = grab && (dev.keyboard || dev.mouse);
+        let want = grab && (dev.keyboard || (dev.mouse && grab_mouse));
         if dev.grabbed == want {
             continue;
         }
@@ -519,7 +504,11 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
     while !shared.stop.load(Ordering::Relaxed) {
         // No-op unless the state flipped; also covers the first iteration, so no separate
         // pre-loop call is needed.
-        apply_grab(&mut devices, shared.grab.load(Ordering::Relaxed));
+        apply_grab(
+            &mut devices,
+            shared.grab.load(Ordering::Relaxed),
+            shared.relative.load(Ordering::Relaxed),
+        );
         let iter_start = Instant::now();
         // SAFETY: `fds` is a valid slice of `nfds` pollfds for the duration of the call.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_TIMEOUT_MS) };
@@ -682,7 +671,6 @@ fn flush_motion(dev: &mut Device, sink: &impl Fn(&InputEvent), shared: &Shared) 
         let y = (shared.abs_y.load(Ordering::Relaxed) + dev.dy).clamp(0, h as i32 - 1);
         shared.abs_x.store(x, Ordering::Relaxed);
         shared.abs_y.store(y, Ordering::Relaxed);
-        shared.abs_dirty.store(true, Ordering::Relaxed);
         sink(&mouse::move_event(x, y, w, h));
     }
     dev.dx = 0;

@@ -133,8 +133,12 @@ impl Cursor {
 }
 
 fn set_compositor_visible(visible: bool) -> bool {
+    // `SDL_webOSCursorVisibility(visible)` maps 1:1 to
+    // `wl_webos_input_manager_set_cursor_visibility` — TRUE shows, FALSE hides, and a hide
+    // sticks until the next show (or a new Wayland connection). An earlier `!visible` here
+    // made Capture-off *hide* the TV pointer; only restarting the client restored it.
     // SAFETY: plain integer argument, no pointers; caller is the SDL video thread.
-    let supported = unsafe { SDL_webOSCursorVisibility(bool_to_sdl(!visible)) } == SDL_bool::SDL_TRUE;
+    let supported = unsafe { SDL_webOSCursorVisibility(bool_to_sdl(visible)) } == SDL_bool::SDL_TRUE;
     // Logged once, for stray-cursor bug reports.
     if !SUPPORT_LOGGED.swap(true, Ordering::Relaxed) {
         tracing::info!(

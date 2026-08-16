@@ -218,8 +218,9 @@ pub struct Settings {
     /// hidden, relative `MouseMove` deltas sent (absolute coords stop at the panel edge), host
     /// draws the only cursor. Off: absolute `MouseMoveAbs`, and `CLIENT_CAP_CURSOR` tells a
     /// capable host to stop compositing its own so the local pointer stays visible — otherwise
-    /// two cursors or none. Takes effect next stream; `serde(default)` keeps old settings.json
-    /// loading as `true`.
+    /// two cursors or none. USB/Bluetooth keyboards are grabbed in both modes so the compositor
+    /// never sees modifiers or typing; mice follow this flag. Takes effect next stream;
+    /// `serde(default)` keeps old settings.json loading as `true`.
     #[serde(default = "default_cursor_capture")]
     pub cursor_capture: bool,
     /// Ask the TV to switch to its Game picture mode for the duration of a stream (the

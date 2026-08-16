@@ -23,9 +23,9 @@
 //! groups — verified on-device, non-rooted, webOS 10.3.
 //!
 //! **Grabbed while active.** `EVIOCGRAB` is scoped to [`HidMouse::set_active`], not held for the
-//! reader's whole life: `cursor::COMPOSITOR_CURSOR_CONTROL` is verified off on webOS 26 (see
-//! `cursor.rs`), so an ungrabbed node leaves the compositor drawing its own pointer from the same
-//! evdev reports we forward. Scoping it to "caller wants it" rather than the reader's whole life
+//! reader's whole life: grab starves surface-manager of *this* node's reports, but the Magic
+//! Remote is still a pointer source, so the TV arrow is hidden by LSM hotspot 254 (see
+//! `cursor.rs`), not by grab alone. Scoping grab to "caller wants it" rather than the reader's whole life
 //! bounds a wedged thread's blast radius to "no HID input" instead of "no mouse input at all,
 //! TV-wide" — the kernel releases the grab the moment our fd closes (including on panic), and the
 //! surface-manager's own fd stays open throughout, just starved of events while ours holds it.

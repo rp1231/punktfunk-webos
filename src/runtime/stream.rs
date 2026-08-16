@@ -321,8 +321,8 @@ pub(super) fn run_inner() -> Result<()> {
                         .is_some_and(crate::platform::webos::evmouse::HidMouse::has_device)
                 {
                     hid_device_seen = true;
-                    // Only now is the node grabbed, so only now can a compositor hide stick — the
-                    // one at connect raced the reader thread's scan.
+                    // Reader thread has the node now; re-send LSM blank hotspot in case connect
+                    // raced the first grab.
                     cursor.reassert_hidden();
                 } else if !hid_device_seen
                     && !capture_relative_fallback

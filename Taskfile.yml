@@ -43,7 +43,11 @@ vars:
       if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
         echo "${GITHUB_REF_NAME#v}"
       else
-        LATEST=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.1)
+        # `describe | sed` succeeds with empty stdout when there are no tags (the
+        # pipe hides describe's failure), which packaged `"version": ""` and SAM
+        # rejected the IPK. Default only when the result is actually empty.
+        LATEST=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+        LATEST=${LATEST:-0.0.1}
         SHA=$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
         echo "${LATEST}+git.${SHA}"
       fi

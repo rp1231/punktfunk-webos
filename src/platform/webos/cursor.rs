@@ -1,71 +1,129 @@
-//! Two layers can draw the local pointer: SDL's own cursor (`show_cursor`, works) and the
-//! compositor's (`SDL_webOSCursorVisibility`, global state, re-shown on activity — see
-//! [`restore_on_exit`]).
+//! Two layers can draw a pointer: SDL's own cursor (`show_cursor`) and the compositor's
+//! (luna-surfacemanager / LSM).
 //!
-//! The compositor layer is normally kept quiet by `evmouse`'s `EVIOCGRAB` — starved of reports,
-//! it stops drawing. But starving only stops *future* draws: an arrow already on screen when the
-//! stream starts stays painted until something retracts it, which is why the hide is also
-//! requested outright on each [`Cursor::apply`] and again once the grab is actually in place
-//! ([`Cursor::reassert_hidden`]). The 4 Hz re-assert *loop* stays off, see
-//! [`COMPOSITOR_REASSERT`].
+//! **Do not call `SDL_webOSCursorVisibility`.** On webOS 26 a hide via
+//! `wl_webos_input_manager.set_cursor_visibility` is permanent for this Wayland connection —
+//! a later show does not restore the arrow. `SDL_ShowCursor(false)` is also the wrong hide:
+//! the SDL-webOS fork sends hotspot `(0, 0)`, which LSM ignores, so the system arrow stays.
+//!
+//! LSM treats two reserved `wl_pointer.set_cursor` hotspots as commands, not coordinates
+//! (`WebOSCoreCompositor::getCursor` in luna-surfacemanager):
+//! - `(254, 254)` → `Qt::BlankCursor` (TV pointer gone)
+//! - `(255, 255)` → `Qt::ArrowCursor` (system arrow back)
+//!
+//! Capture-on sets 254; Capture-off / menu / panic restore sets 255. SDL must keep the
+//! cursor *shown* so Wayland actually emits those hotspots instead of the hidden-cursor
+//! path. `EVIOCGRAB` still starves mouse reports (no fighting the host); it does not hide
+//! the arrow on its own because the Magic Remote remains a pointer source.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr::NonNull;
 use std::sync::OnceLock;
-use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use sdl2::mouse::MouseUtil;
-use sdl2::sys::SDL_bool;
+use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::surface::Surface;
 
-extern "C" {
-    /// SDL-webOS extension; `SDL_FALSE` self-gates on TVs without `wl_webos_input_manager`.
-    fn SDL_webOSCursorVisibility(visible: SDL_bool) -> SDL_bool;
+/// LSM blank-cursor sentinel (`WebOSCoreCompositor::getCursor`).
+const HOTSPOT_BLANK: i32 = 254;
+/// LSM default-arrow sentinel.
+const HOTSPOT_ARROW: i32 = 255;
+/// `SDL_CreateColorCursor` rejects a hotspot outside the surface; 255 needs a 256-wide image.
+const SENTINEL_SIZE: u32 = 256;
+/// LSM can redraw the system arrow on Magic Remote activity. Re-sending hotspot 254 every
+/// motion event is a Wayland `set_cursor` + surface commit each time — after a long stream
+/// that is the input lag. Once per this interval is enough to blank it again.
+const LSM_REASSERT_MIN: Duration = Duration::from_millis(500);
+
+struct LsmSentinels {
+    blank: NonNull<sdl2::sys::SDL_Cursor>,
+    arrow: NonNull<sdl2::sys::SDL_Cursor>,
 }
 
-/// Polling re-assert is off: verified on webOS 26 the compositor re-shows its arrow regardless,
-/// so the loop only spent Wayland requests. Kept, not deleted, in case a firmware/SDL-fork fix
-/// makes flipping this worth it. The one-shot retracts are unconditional — a different question
-/// from whether the hide *sticks* against later pointer activity.
-const COMPOSITOR_REASSERT: bool = false;
+// Only touched on the SDL video thread; `OnceLock` needs `Sync`.
+unsafe impl Send for LsmSentinels {}
+unsafe impl Sync for LsmSentinels {}
 
-/// Compositor gives no "took the pointer back" event, so re-hiding just polls on activity,
-/// capped here at 4 Wayland requests/sec.
-const REASSERT_INTERVAL: Duration = Duration::from_millis(250);
+fn lsm_sentinels() -> Option<&'static LsmSentinels> {
+    static SENTINELS: OnceLock<Option<LsmSentinels>> = OnceLock::new();
+    SENTINELS.get_or_init(try_create_lsm_sentinels).as_ref()
+}
 
-/// Global: shared with the panic hook, which has no [`Cursor`] to reach for.
-static COMPOSITOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-static SUPPORT_LOGGED: AtomicBool = AtomicBool::new(false);
-static OWNER_THREAD: OnceLock<ThreadId> = OnceLock::new();
+fn try_create_lsm_sentinels() -> Option<LsmSentinels> {
+    let blank = make_lsm_cursor(HOTSPOT_BLANK)?;
+    let arrow = make_lsm_cursor(HOTSPOT_ARROW)?;
+    tracing::info!("LSM cursor sentinels ready (blank {HOTSPOT_BLANK}, arrow {HOTSPOT_ARROW})");
+    Some(LsmSentinels { blank, arrow })
+}
 
-/// The local pointer's visibility on every layer, plus capture state. Drive from the SDL video thread.
+fn make_lsm_cursor(hotspot: i32) -> Option<NonNull<sdl2::sys::SDL_Cursor>> {
+    let mut surface = match Surface::new(SENTINEL_SIZE, SENTINEL_SIZE, PixelFormatEnum::ARGB8888)
+        .or_else(|_| Surface::new(SENTINEL_SIZE, SENTINEL_SIZE, PixelFormatEnum::RGBA32))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("LSM sentinel surface: {e}");
+            return None;
+        }
+    };
+    let _ = surface.fill_rect(None, Color::RGBA(0, 0, 0, 0));
+    // SAFETY: `surface.raw()` is a live `SDL_Surface` for this call; SDL copies the pixels
+    // into the Wayland cursor. The surface may drop afterwards. The `SDL_Cursor` is leaked
+    // on purpose — freeing it would `SDL_SetCursor(def)` and undo hotspot 255 on stream exit.
+    let Some(raw) = NonNull::new(unsafe { sdl2::sys::SDL_CreateColorCursor(surface.raw(), hotspot, hotspot) }) else {
+        tracing::warn!(
+            "SDL_CreateColorCursor hotspot {hotspot} failed: {}",
+            sdl2::get_error()
+        );
+        return None;
+    };
+    Some(raw)
+}
+
+fn set_lsm_cursor(ptr: NonNull<sdl2::sys::SDL_Cursor>) {
+    // SAFETY: `ptr` came from `SDL_CreateColorCursor` and is never freed. SDL video thread.
+    unsafe { sdl2::sys::SDL_SetCursor(ptr.as_ptr()) };
+}
+
+/// The local pointer's SDL visibility and capture state. Drive from the SDL video thread.
 pub struct Cursor {
     mouse: MouseUtil,
-    last_assert: Instant,
     captured: bool,
     sdl_relative: bool,
+    last_lsm: Instant,
 }
 
 impl Cursor {
     pub fn new(mouse: MouseUtil) -> Self {
         Self {
             mouse,
-            last_assert: Instant::now(),
             captured: false,
             sdl_relative: true,
+            last_lsm: Instant::now(),
         }
     }
 
     /// Stop asking SDL for relative mode, for when motion is read via `super::evmouse` instead:
     /// the fork emulates relative mode with a screen-centre warp per motion event, which is
     /// pure waste for a source we don't read. aurora-tv does the same under `hardware_mouse`.
+    ///
+    /// Must run **before** [`Self::set_captured`]`(true)` when a HID mouse is expected: capture
+    /// otherwise enables relative mode for the HID scan window, parks SDL at screen centre,
+    /// and the next Capture-off stream shows the TV cursor at a constant offset.
     pub fn disable_sdl_relative(&mut self) {
         self.sdl_relative = false;
         self.apply();
     }
 
-    /// Capture the pointer for the host — hidden on both layers, and SDL switched to
-    /// relative mode so motion arrives as unbounded deltas instead of coordinates that
-    /// stop at the panel edge. Uncaptured is the menu/desktop state: visible, absolute.
+    /// Capture-on fallback when no HID mouse shows up — Magic Remote needs unbounded deltas.
+    pub fn enable_sdl_relative(&mut self) {
+        self.sdl_relative = true;
+        self.apply();
+    }
+
+    /// Capture the pointer for the host — LSM blank hotspot, and SDL switched to relative
+    /// mode so motion arrives as unbounded deltas instead of coordinates that stop at the
+    /// panel edge. Uncaptured is the menu/desktop state: LSM arrow hotspot, absolute.
     pub fn set_captured(&mut self, captured: bool) {
         self.captured = captured;
         self.apply();
@@ -75,77 +133,50 @@ impl Cursor {
         self.captured
     }
 
+    /// Put SDL's pointer on `(x, y)`. Used after Capture-on so the next desktop/menu
+    /// session does not inherit the relative-mode centre warp.
+    pub fn warp_abs(&self, window: &sdl2::video::Window, x: i32, y: i32) {
+        self.mouse.warp_mouse_in_window(window, x, y);
+    }
+
     fn apply(&mut self) {
-        let _ = OWNER_THREAD.set(std::thread::current().id());
-        self.mouse.show_cursor(!self.captured);
-        self.mouse.set_relative_mouse_mode(self.captured && self.sdl_relative);
-        set_compositor_visible(!self.captured);
-        COMPOSITOR_HIDDEN.store(self.captured, Ordering::Relaxed);
-        self.last_assert = Instant::now();
+        self.apply_lsm_hotspot();
+        self.mouse
+            .set_relative_mouse_mode(self.captured && self.sdl_relative);
     }
 
-    /// Asks the compositor once more to drop its pointer. For the point where the evdev grab has
-    /// actually landed — [`apply`](Self::apply) runs before `evmouse`'s background scan finds a
-    /// node, so any motion in that window can repaint the arrow it just retracted. No-op while
-    /// uncaptured.
+    fn apply_lsm_hotspot(&mut self) {
+        // Keep SDL's cursor *shown*: the fork's hide path sends hotspot (0, 0), which LSM
+        // does not treat as blank, so the system arrow stays.
+        self.mouse.show_cursor(true);
+        let Some(s) = lsm_sentinels() else {
+            self.mouse.show_cursor(!self.captured);
+            return;
+        };
+        set_lsm_cursor(if self.captured { s.blank } else { s.arrow });
+        self.last_lsm = Instant::now();
+    }
+
+    /// LSM blank again once the evdev grab has actually landed. No-op while uncaptured.
     pub fn reassert_hidden(&mut self) {
-        // The interval doubles as a debounce: callers pair this with a state change that already
-        // ran `apply` (`disable_sdl_relative`), and repeating its request in the same tick would
-        // be a pure duplicate.
-        if !self.captured || self.last_assert.elapsed() < REASSERT_INTERVAL {
+        if !self.captured {
             return;
         }
-        set_compositor_visible(false);
-        self.last_assert = Instant::now();
+        self.apply_lsm_hotspot();
     }
 
-    /// Re-asserts the hide when due; no-op unless hidden and [`COMPOSITOR_REASSERT`] is on.
+    /// webOS can redraw the system arrow on Magic Remote activity. Rate-limited: a hide on
+    /// every `MouseMotion` floods the compositor and input starts lagging on a long stream.
     pub fn on_pointer_activity(&mut self) {
-        if !COMPOSITOR_REASSERT {
-            return;
+        if self.captured && self.last_lsm.elapsed() >= LSM_REASSERT_MIN {
+            self.apply_lsm_hotspot();
         }
-        if !COMPOSITOR_HIDDEN.load(Ordering::Relaxed) {
-            return;
-        }
-        if self.last_assert.elapsed() < REASSERT_INTERVAL {
-            return;
-        }
-        self.last_assert = Instant::now();
-        set_compositor_visible(false);
     }
 }
 
-fn set_compositor_visible(visible: bool) -> bool {
-    // SAFETY: plain integer argument, no pointers; caller is the SDL video thread.
-    let supported = unsafe { SDL_webOSCursorVisibility(bool_to_sdl(!visible)) } == SDL_bool::SDL_TRUE;
-    // Logged once, for stray-cursor bug reports.
-    if !SUPPORT_LOGGED.swap(true, Ordering::Relaxed) {
-        tracing::info!(
-            "compositor cursor visibility control: {}",
-            if supported { "available" } else { "unavailable" }
-        );
-    }
-    supported
-}
-
-const fn bool_to_sdl(value: bool) -> SDL_bool {
-    if value {
-        SDL_bool::SDL_TRUE
-    } else {
-        SDL_bool::SDL_FALSE
-    }
-}
-
-/// Put the compositor pointer back if a [`Cursor`] hid it — for exits that skip its teardown
-/// (the panic hook); a graceful quit already calls [`Cursor::set_captured`]`(false)`. No-op
-/// off the hiding thread, since a panicking thread has no business touching its Wayland connection.
+/// Panic-hook: LSM arrow hotspot, so a crash mid-capture does not leave the TV without a pointer.
 pub fn restore_on_exit() {
-    if !COMPOSITOR_HIDDEN.swap(false, Ordering::Relaxed) {
-        return;
+    if let Some(s) = lsm_sentinels() {
+        set_lsm_cursor(s.arrow);
     }
-    if OWNER_THREAD.get() != Some(&std::thread::current().id()) {
-        tracing::warn!("cursor left hidden — panic is off the SDL thread, leaving it to client teardown");
-        return;
-    }
-    set_compositor_visible(true);
 }

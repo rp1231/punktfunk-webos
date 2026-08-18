@@ -18,6 +18,7 @@
 
 use std::ptr::NonNull;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use sdl2::mouse::MouseUtil;
 use sdl2::pixels::{Color, PixelFormatEnum};
@@ -29,6 +30,10 @@ const HOTSPOT_BLANK: i32 = 254;
 const HOTSPOT_ARROW: i32 = 255;
 /// `SDL_CreateColorCursor` rejects a hotspot outside the surface; 255 needs a 256-wide image.
 const SENTINEL_SIZE: u32 = 256;
+/// LSM can redraw the system arrow on Magic Remote activity. Re-sending hotspot 254 every
+/// motion event is a Wayland `set_cursor` + surface commit each time — after a long stream
+/// that is the input lag. Once per this interval is enough to blank it again.
+const LSM_REASSERT_MIN: Duration = Duration::from_millis(500);
 
 struct LsmSentinels {
     blank: NonNull<sdl2::sys::SDL_Cursor>,
@@ -85,6 +90,7 @@ pub struct Cursor {
     mouse: MouseUtil,
     captured: bool,
     sdl_relative: bool,
+    last_lsm: Instant,
 }
 
 impl Cursor {
@@ -93,6 +99,7 @@ impl Cursor {
             mouse,
             captured: false,
             sdl_relative: true,
+            last_lsm: Instant::now(),
         }
     }
 
@@ -147,6 +154,7 @@ impl Cursor {
             return;
         };
         set_lsm_cursor(if self.captured { s.blank } else { s.arrow });
+        self.last_lsm = Instant::now();
     }
 
     /// LSM blank again once the evdev grab has actually landed. No-op while uncaptured.
@@ -157,9 +165,10 @@ impl Cursor {
         self.apply_lsm_hotspot();
     }
 
-    /// webOS can redraw the system arrow on pointer activity; re-send the blank hotspot.
+    /// webOS can redraw the system arrow on Magic Remote activity. Rate-limited: a hide on
+    /// every `MouseMotion` floods the compositor and input starts lagging on a long stream.
     pub fn on_pointer_activity(&mut self) {
-        if self.captured {
+        if self.captured && self.last_lsm.elapsed() >= LSM_REASSERT_MIN {
             self.apply_lsm_hotspot();
         }
     }
